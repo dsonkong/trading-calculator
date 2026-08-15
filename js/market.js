@@ -1,87 +1,116 @@
 /**
- * Trading Calculator • Resilient Market Data Module
+ * Trading Calculator • Direct Serverless Yahoo Finance Data Module
  */
 
+const TIMEFRAME_MAP = {
+    '1D': { range: '1d', interval: '5m' },
+    '1W': { range: '5d', interval: '15m' },
+    '1M': { range: '1mo', interval: '1h' },
+    '3M': { range: '3mo', interval: '1d' },
+    '6M': { range: '6mo', interval: '1d' },
+    '1Y': { range: '1y', interval: '1d' },
+    '52W_HIGH': { range: '1y', interval: '1h' },
+    '5Y': { range: '5y', interval: '1wk' },
+    '10Y': { range: '10y', interval: '1wk' }
+};
+
 const Market = {
-    async fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-        try {
-            const res = await fetch(url, { ...options, signal: controller.signal });
-            clearTimeout(timeoutId);
-            return res;
-        } catch (err) {
-            clearTimeout(timeoutId);
-            throw err;
+    async fetchWithProxy(targetUrl, timeoutMs = 10000) {
+        const proxies = [
+            url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+            url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
+        ];
+
+        for (const makeProxyUrl of proxies) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+            try {
+                const proxyUrl = makeProxyUrl(targetUrl);
+                const res = await fetch(proxyUrl, { signal: controller.signal });
+                clearTimeout(timeoutId);
+
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data?.chart?.result?.[0]) {
+                        return data.chart.result[0];
+                    }
+                }
+            } catch (err) {
+                clearTimeout(timeoutId);
+                console.warn(`[Market] Proxy attempt failed, trying fallback:`, err.message);
+            }
         }
+        throw new Error("Unable to fetch data directly from Yahoo Finance.");
     },
 
-    async fetchQuote(symbol) {
-        const url = `${CONFIG.apiBaseUrl}/quote?symbol=${encodeURIComponent(symbol)}`;
-        const res = await this.fetchWithTimeout(url);
-        if (!res.ok) throw new Error(`yfinance Quote Error (${res.status})`);
-        const data = await res.json();
-        
-        if (!data || data.currentPrice === undefined) {
-            throw new Error("Invalid quote response.");
+    async fetchQuoteAndMetrics(symbol) {
+        const targetUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1y&interval=1d`;
+        const result = await this.fetchWithProxy(targetUrl);
+
+        const meta = result.meta || {};
+        const currentPrice = Number(meta.regularMarketPrice || meta.chartPreviousClose || 0);
+        const previousClose = Number(meta.chartPreviousClose || currentPrice);
+        const highOfDay = Number(meta.regularMarketDayHigh || currentPrice);
+        const lowOfDay = Number(meta.regularMarketDayLow || currentPrice);
+
+        // Derive 52-Week High from historical chart data or metadata
+        let high52 = Number(meta.fiftyTwoWeekHigh || 0);
+        if (!high52 && result.indicators?.quote?.[0]?.high) {
+            const highs = result.indicators.quote[0].high.filter(v => typeof v === 'number' && !isNaN(v));
+            if (highs.length > 0) high52 = Math.max(...highs);
         }
-        
+        if (!high52) high52 = Math.max(currentPrice, highOfDay);
+
         return {
-            symbol: data.symbol || symbol,
-            currentPrice: Number(data.currentPrice),
-            previousClose: Number(data.previousClose),
-            highOfDay: Number(data.highOfDay),
-            lowOfDay: Number(data.lowOfDay),
-            timestamp: Number(data.timestamp) || Math.floor(Date.now() / 1000)
+            symbol: meta.symbol || symbol,
+            currentPrice,
+            previousClose,
+            highOfDay,
+            lowOfDay,
+            high52: Number(high52.toFixed(2)),
+            timestamp: Math.floor(Date.now() / 1000)
         };
     },
 
-    async fetchMetrics(symbol) {
-        const url = `${CONFIG.apiBaseUrl}/metrics?symbol=${encodeURIComponent(symbol)}`;
-        const res = await this.fetchWithTimeout(url);
-        if (!res.ok) throw new Error(`yfinance Metrics Error (${res.status})`);
-        const data = await res.json();
-        
-        const high52 = Number(data.high52);
-        if (!high52 || isNaN(high52)) throw new Error("52-week high metric unavailable");
-        
-        return { high52 };
-    },
-
     async fetchCandles(symbol, timeframe = '52W_HIGH') {
-        const url = `${CONFIG.apiBaseUrl}/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}`;
-        
-        try {
-            const res = await this.fetchWithTimeout(url, {}, 8000);
-            const data = await res.json();
-            
-            if (data.status === 'ok' && Array.isArray(data.candles) && data.candles.length > 0) {
-                return data.candles.map(item => ({
-                    date: new Date(item.timestamp * 1000),
-                    price: Number(item.price)
-                }));
+        const tf = TIMEFRAME_MAP[timeframe] || TIMEFRAME_MAP['52W_HIGH'];
+        const targetUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${tf.range}&interval=${tf.interval}`;
+
+        const result = await this.fetchWithProxy(targetUrl);
+        const timestamps = result.timestamp || [];
+        const closes = result.indicators?.quote?.[0]?.close || [];
+
+        let candles = [];
+        for (let i = 0; i < timestamps.length; i++) {
+            const price = closes[i];
+            if (typeof price === 'number' && !isNaN(price)) {
+                candles.push({
+                    date: new Date(timestamps[i] * 1000),
+                    price: Number(price.toFixed(2))
+                });
             }
-            throw new Error(data.error || "No historical candle data returned");
-        } catch (error) {
-            console.error(`[Market] Candle fetch failed for ${timeframe}:`, error.message);
-            throw error;
         }
+
+        if (timeframe === '52W_HIGH' && candles.length > 1) {
+            let maxIdx = 0;
+            let maxPrice = -1;
+            for (let i = 0; i < candles.length; i++) {
+                if (candles[i].price > maxPrice) {
+                    maxPrice = candles[i].price;
+                    maxIdx = i;
+                }
+            }
+            if (maxIdx < candles.length - 1) {
+                candles = candles.slice(maxIdx);
+            }
+        }
+
+        return candles;
     },
 
     async fetchAll(symbol) {
-        const [quoteResult, metricsResult] = await Promise.allSettled([
-            this.fetchQuote(symbol),
-            this.fetchMetrics(symbol)
-        ]);
-
-        if (quoteResult.status === "rejected") throw quoteResult.reason;
-
-        const quote = quoteResult.value;
-        const high52 = metricsResult.status === "fulfilled" 
-            ? metricsResult.value.high52 
-            : Math.max(quote.currentPrice, quote.highOfDay || 0);
-
-        return { ...quote, high52 };
+        return await this.fetchQuoteAndMetrics(symbol);
     }
 };
 

@@ -2,12 +2,7 @@
  * Trading Calculator • Configuration & Helpers
  */
 
-function resolveApiBaseUrl() {
-    return "https://trading-calculator-backend.onrender.com/api";
-}
-
 const CONFIG = Object.freeze({
-    apiBaseUrl: resolveApiBaseUrl(),
     defaultSymbol: "VT",
     defaultTimeframe: "52W_HIGH",
 
