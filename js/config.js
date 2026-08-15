@@ -3,17 +3,7 @@
  */
 
 function resolveApiBaseUrl() {
-    const host = window.location.hostname || "127.0.0.1";
-    const protocol = window.location.protocol;
-
-    // If running inside VS Code Dev Tunnels (e.g. 4mqf17sd-5500.asse.devtunnels.ms)
-    if (host.includes("devtunnels.ms")) {
-        const backendHost = host.replace("-5500", "-5000");
-        return `${protocol}//${backendHost}/api`;
-    }
-
-    // Standard local / Wi-Fi access
-    return `http://${host}:5000/api`;
+    return "https://trading-calculator-backend.onrender.com/api";
 }
 
 const CONFIG = Object.freeze({
