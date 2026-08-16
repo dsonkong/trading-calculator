@@ -2,43 +2,38 @@
  * Trading Calculator • Storage & Formatting Module
  */
 
-function formatWithThousandSeparator(val) {
-    if (val === null || val === undefined || val === "") return "";
-    const str = String(val);
-    
-    let clean = "";
-    let hasDecimal = false;
-    for (const char of str) {
-        if (/\d/.test(char)) clean += char;
-        else if (char === "." && !hasDecimal) {
-            clean += char;
-            hasDecimal = true;
-        }
-    }
+function formatWithThousandSeparator(value) {
+    if (value === null || value === undefined || value === "") return "";
+
+    const str = String(value);
+    const clean = str.replace(/[^\d.]/g, "");
     if (!clean) return "";
 
-    const parts = clean.split(".");
-    let integerPart = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-    const decimalPart = parts.length > 1 ? "." + parts.slice(1).join("") : "";
+    const [intPart, ...decimalParts] = clean.split(".");
+    const formattedInt = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    const decimalPart = decimalParts.length ? `.${decimalParts.join("")}` : "";
 
-    return integerPart + decimalPart;
+    return `${formattedInt}${decimalPart}`;
 }
 
-function parseFormattedNumber(val) {
-    if (val === null || val === undefined || val === "") return 0;
-    const cleanVal = String(val).replace(/,/g, "").trim();
-    const num = Number(cleanVal);
+function parseFormattedNumber(value) {
+    if (value === null || value === undefined || value === "") return 0;
+
+    const clean = String(value).replace(/,/g, "").trim();
+    const num = Number(clean);
+
     return Number.isFinite(num) ? num : 0;
 }
 
 const Storage = {
     save(inputs) {
         if (!inputs) return;
+
         try {
             if (inputs.symbol) localStorage.setItem(CONFIG.storage.symbol, inputs.symbol);
-            localStorage.setItem(CONFIG.storage.previousPrice, inputs.previousPrice);
-            localStorage.setItem(CONFIG.storage.previousQuantity, inputs.previousQuantity);
-            localStorage.setItem(CONFIG.storage.reserve, inputs.reserve);
+            localStorage.setItem(CONFIG.storage.previousPrice, String(inputs.previousPrice));
+            localStorage.setItem(CONFIG.storage.previousQuantity, String(inputs.previousQuantity));
+            localStorage.setItem(CONFIG.storage.reserve, String(inputs.reserve));
         } catch (error) {
             console.warn("localStorage unavailable:", error);
         }
@@ -55,11 +50,12 @@ const Storage = {
 
     getNumber(key) {
         try {
-            const val = localStorage.getItem(key);
-            if (val === null || val === "") return null;
-            const num = Number(val);
+            const value = localStorage.getItem(key);
+            if (value === null || value === "") return null;
+
+            const num = Number(value);
             return Number.isFinite(num) ? num : null;
-        } catch (e) {
+        } catch (error) {
             return null;
         }
     }
@@ -67,28 +63,31 @@ const Storage = {
 
 function loadInputsToScreen() {
     const data = Storage.load();
-    const sym = $("symbolInput");
-    const pPrice = $("previousPrice");
-    const pQty = $("previousQuantity");
-    const res = $("reserve");
 
-    if (sym && data.symbol) sym.value = data.symbol;
-    if (pPrice && data.previousPrice !== null) pPrice.value = formatWithThousandSeparator(data.previousPrice);
-    if (pQty && data.previousQuantity !== null) pQty.value = formatWithThousandSeparator(data.previousQuantity);
-    if (res && data.reserve !== null) res.value = formatWithThousandSeparator(data.reserve);
+    const fields = {
+        symbolInput: data.symbol,
+        previousPrice: data.previousPrice,
+        previousQuantity: data.previousQuantity,
+        reserve: data.reserve
+    };
+
+    Object.entries(fields).forEach(([id, value]) => {
+        const el = $(id);
+        if (!el || value === null || value === undefined) return;
+
+        const formatted =
+            id === "symbolInput" ? value : formatWithThousandSeparator(value);
+
+        el.value = formatted;
+    });
 }
 
 function getInputsFromScreen() {
-    const sym = $("symbolInput");
-    const pPrice = $("previousPrice");
-    const pQty = $("previousQuantity");
-    const res = $("reserve");
-
     return {
-        symbol: sym ? sym.value.trim().toUpperCase() : CONFIG.defaultSymbol,
-        previousPrice: parseFormattedNumber(pPrice ? pPrice.value : 0),
-        previousQuantity: parseFormattedNumber(pQty ? pQty.value : 0),
-        reserve: parseFormattedNumber(res ? res.value : 0)
+        symbol: ($("symbolInput")?.value || CONFIG.defaultSymbol).trim().toUpperCase(),
+        previousPrice: parseFormattedNumber($("previousPrice")?.value || 0),
+        previousQuantity: parseFormattedNumber($("previousQuantity")?.value || 0),
+        reserve: parseFormattedNumber($("reserve")?.value || 0)
     };
 }
 
@@ -97,5 +96,6 @@ function validateInputs(inputs) {
     if (!isPositiveNumber(inputs.previousPrice)) throw new Error("Enter a valid Previous Trade Price.");
     if (!isPositiveNumber(inputs.previousQuantity)) throw new Error("Enter a valid Previous Trade Quantity.");
     if (!isNonNegativeNumber(inputs.reserve)) throw new Error("Reserve cannot be negative.");
+
     return true;
 }

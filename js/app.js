@@ -6,13 +6,14 @@ window.marketData = null;
 let priceChartInstance = null;
 let currentTimeframe = CONFIG.defaultTimeframe || "52W_HIGH";
 let cachedCandles = null;
+let inputTimer = null;
 
 async function recalculateLocal(fetchNewCandles = false) {
     try {
         if (!window.marketData) return;
 
         const inputs = getInputsFromScreen();
-        
+
         if (fetchNewCandles || !cachedCandles) {
             try {
                 const symbol = inputs.symbol || window.marketData?.symbol || CONFIG.defaultSymbol;
@@ -23,22 +24,24 @@ async function recalculateLocal(fetchNewCandles = false) {
             }
         }
 
-        let result = null;
-
-        if (inputs.previousPrice && inputs.previousQuantity) {
-            validateInputs(inputs);
-
-            inputs.currentPrice = window.marketData.currentPrice;
-            inputs.high52 = window.marketData.high52;
-
-            Storage.save(inputs);
-
-            result = calculate(inputs);
-            updateResults(result);
-            renderQuantityTable(result.quantityTable, inputs.previousPrice);
+        if (!(inputs.previousPrice && inputs.previousQuantity)) {
+            updateChart(null, inputs?.previousPrice || null, cachedCandles);
+            return;
         }
-        
-        updateChart(result, inputs?.previousPrice || null, cachedCandles);
+
+        validateInputs(inputs);
+
+        inputs.currentPrice = window.marketData.currentPrice;
+        inputs.high52 = window.marketData.high52;
+
+        Storage.save(inputs);
+
+        const result = calculate(inputs);
+        const coveredRow = getCoveredRow(result.quantityTable, inputs.reserve, inputs.previousPrice);
+
+        updateResults(result);
+        renderQuantityTable(result.quantityTable, inputs.previousPrice, coveredRow?.price);
+        updateChart(result, inputs.previousPrice, cachedCandles);
     } catch (error) {
         console.warn("Calculation notice:", error.message);
     }
@@ -54,56 +57,71 @@ async function refreshFull() {
     }
 }
 
+function scheduleRecalc() {
+    clearTimeout(inputTimer);
+    inputTimer = setTimeout(() => recalculateLocal(false), 150);
+}
+
 function updateResults(result) {
-    setText("buyPrice", formatPrice(result.buy.price));
-    setText("buyQuantity", formatQuantity(result.buy.quantity));
-    setText("buyAmount", formatAmount(result.buy.amount));
+    const fieldMap = {
+        buyPrice: result.buy.price,
+        buyQuantity: result.buy.quantity,
+        buyAmount: result.buy.amount,
+        sellPrice: result.sell.price,
+        sellQuantity: result.sell.quantity,
+        sellAmount: result.sell.amount,
+        safetyLevel: result.safetyLevel * 100,
+        margin: typeof result.margin === "string" ? result.margin : result.margin * 100
+    };
 
-    setText("sellPrice", formatPrice(result.sell.price));
-    setText("sellQuantity", formatQuantity(result.sell.quantity));
-    setText("sellAmount", formatAmount(result.sell.amount));
+    Object.entries(fieldMap).forEach(([id, value]) => {
+        const el = $(id);
+        if (!el) return;
 
-    setText("safetyLevel", formatPercentage(result.safetyLevel * 100));
-    setText("margin", typeof(result.margin) === "string" ? result.margin : formatPercentage(result.margin * 100));
+        if (id === "safetyLevel" || id === "margin") {
+            el.textContent = formatPercentage(value);
+            return;
+        }
 
-    if (result.reserveRequired) {
-        setText("reserve80Req", formatAmount(result.reserveRequired.reserve80));
-        setText("reserve90Req", formatAmount(result.reserveRequired.reserve90));
-        setText("reserve100Req", formatAmount(result.reserveRequired.reserve100));
-    }
+        el.textContent = id.includes("Price")
+            ? formatPrice(value)
+            : id.includes("Quantity")
+                ? formatQuantity(value)
+                : formatAmount(value);
+    });
 }
 
-function createCheckBadge(tierClass, labelText) {
-    return `
-        <span class="tier-badge ${tierClass}">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                <polyline points="20 6 9 17 4 12"></polyline>
-            </svg>
-            ${labelText}
-        </span>
-    `;
+function getCoveredRow(rows, reserve, previousPrice) {
+    return findCoveredRow(rows, reserve, previousPrice);
 }
 
-function renderQuantityTable(rows, previousPrice) {
+function renderQuantityTable(rows, previousPrice, coveredPrice = null) {
     const tbody = $("quantityTable")?.querySelector("tbody");
     if (!tbody) return;
 
     const html = rows.map(row => {
-        const isHighlight = row.price === previousPrice;
-        const rowClass = isHighlight ? ' class="highlight-row"' : '';
-        const prevTag = isHighlight ? '<span class="prev-tag">Prev Trade</span>' : '';
+        const highlight =
+            row.price === previousPrice ? "prev" :
+            row.price === coveredPrice ? "covered" :
+            "";
 
-        const q80 = row.qualifies80 ? createCheckBadge("badge-80", "80%") : '<span class="badge-inactive">—</span>';
-        const q90 = row.qualifies90 ? createCheckBadge("badge-90", "90%") : '<span class="badge-inactive">—</span>';
-        const q100 = row.qualifies100 ? createCheckBadge("badge-100", "100%") : '<span class="badge-inactive">—</span>';
+        const prevTag = highlight === "prev"
+            ? '<span class="prev-tag">Previous Trade</span>'
+            : "";
+
+        const coveredTag = highlight === "covered"
+            ? '<span class="covered-tag">Reserve Covered</span>'
+            : "";
 
         return `
-            <tr${rowClass}>
+            <tr class="${highlight ? `highlight-row ${highlight}` : ""}">
                 <td>${formatQuantity(row.quantity)}${prevTag}</td>
                 <td>${formatPrice(row.price)}</td>
-                <td class="text-center">${q80}</td>
-                <td class="text-center">${q90}</td>
-                <td class="text-center">${q100}</td>
+                <td class="text-center">
+                    ${row.reserveRequired > 0 ? formatAmount(row.reserveRequired) : "--"}
+                    ${coveredTag}
+                </td>
+                <td class="text-center">${row.reserveRequired > 0 ? formatPercentage(row.safetyLevel * 100) : "--"}</td>
             </tr>
         `;
     }).join("");
@@ -122,43 +140,47 @@ function updateChart(result, previousPrice, candles) {
 
     if (!candles || candles.length === 0) return;
 
-    const textColor = "#64748b";
-    const gridColor = "rgba(0, 0, 0, 0.06)";
-
-    const labels = candles.map(c => {
-        if (currentTimeframe === '1D') {
-            return c.date.toLocaleTimeString(CONFIG.locale, { hour: '2-digit', minute: '2-digit' });
-        }
-        if (currentTimeframe === '5Y' || currentTimeframe === '10Y') {
-            return c.date.toLocaleDateString(CONFIG.locale, { year: 'numeric', month: 'short' });
-        }
-        return c.date.toLocaleDateString(CONFIG.locale, { year: 'numeric', month: 'short', day: 'numeric' });
-    });
-
-    const prices = candles.map(c => c.price);
     const annotations = {};
 
     if (previousPrice && isFinite(previousPrice) && previousPrice > 0) {
-        annotations.linePrev = createHorizontalLine(previousPrice, '#ca8a04', 'Prev Trade');
+        annotations.linePrev = createHorizontalLine(previousPrice, "#ca8a04", "Prev Trade");
     }
 
     if (result?.buy?.price && isFinite(result.buy.price) && result.buy.price > 0) {
-        annotations.lineBuy = createHorizontalLine(result.buy.price, '#22c55e', 'Buy Order');
+        annotations.lineBuy = createHorizontalLine(result.buy.price, "#22c55e", "Buy Order");
     }
 
     if (result?.sell?.price && isFinite(result.sell.price) && result.sell.price > 0) {
-        annotations.lineSell = createHorizontalLine(result.sell.price, '#ef4444', 'Sell Order');
+        annotations.lineSell = createHorizontalLine(result.sell.price, "#ef4444", "Sell Order");
     }
 
+    const labels = candles.map(c => {
+        if (currentTimeframe === "1D") {
+            return c.date.toLocaleTimeString(CONFIG.locale, { hour: "2-digit", minute: "2-digit" });
+        }
+
+        if (currentTimeframe === "5Y" || currentTimeframe === "10Y") {
+            return c.date.toLocaleDateString(CONFIG.locale, { year: "numeric", month: "short" });
+        }
+
+        return c.date.toLocaleDateString(CONFIG.locale, {
+            year: "numeric",
+            month: "short",
+            day: "numeric"
+        });
+    });
+
+    const prices = candles.map(c => c.price);
+
     priceChartInstance = new Chart(ctx, {
-        type: 'line',
+        type: "line",
         data: {
-            labels: labels,
+            labels,
             datasets: [{
                 label: `${window.marketData?.symbol || CONFIG.defaultSymbol} Real Price ($USD)`,
                 data: prices,
-                borderColor: '#2563eb',
-                backgroundColor: 'rgba(37, 99, 235, 0.08)',
+                borderColor: "#2563eb",
+                backgroundColor: "rgba(37, 99, 235, 0.08)",
                 pointRadius: 0,
                 pointHoverRadius: 6,
                 borderWidth: 2.5,
@@ -169,26 +191,30 @@ function updateChart(result, previousPrice, candles) {
         options: {
             responsive: true,
             maintainAspectRatio: false,
-            interaction: { mode: 'index', intersect: false },
+            interaction: { mode: "index", intersect: false },
             plugins: {
                 legend: { display: false },
                 tooltip: {
                     callbacks: { label: ctx => ` Price: $${ctx.parsed.y.toFixed(2)}` }
                 },
-                annotation: { annotations: annotations }
+                annotation: { annotations }
             },
             scales: {
                 x: {
-                    ticks: { color: textColor, font: { size: 10, weight: '500' }, maxTicksLimit: 8 },
+                    ticks: {
+                        color: "#64748b",
+                        font: { size: 10, weight: "500" },
+                        maxTicksLimit: 8
+                    },
                     grid: { display: false }
                 },
                 y: {
                     ticks: {
-                        color: textColor,
-                        font: { size: 11, weight: '600' },
-                        callback: val => '$' + Number(val)
+                        color: "#64748b",
+                        font: { size: 11, weight: "600" },
+                        callback: val => "$" + Number(val)
                     },
-                    grid: { color: gridColor }
+                    grid: { color: "rgba(0, 0, 0, 0.06)" }
                 }
             }
         }
@@ -197,7 +223,7 @@ function updateChart(result, previousPrice, candles) {
 
 function createHorizontalLine(value, color, labelText) {
     return {
-        type: 'line',
+        type: "line",
         yMin: value,
         yMax: value,
         borderColor: color,
@@ -206,10 +232,10 @@ function createHorizontalLine(value, color, labelText) {
         label: {
             display: true,
             content: `${labelText}: $${value.toFixed(2)}`,
-            position: 'end',
+            position: "end",
             backgroundColor: color,
-            color: 'white',
-            font: { size: 11, weight: 'bold' },
+            color: "white",
+            font: { size: 11, weight: "bold" },
             padding: { x: 8, y: 4 }
         }
     };
@@ -217,6 +243,7 @@ function createHorizontalLine(value, color, labelText) {
 
 function attachTimeframeEvents() {
     const buttons = document.querySelectorAll(".time-btn");
+
     buttons.forEach(btn => {
         btn.addEventListener("click", async (e) => {
             buttons.forEach(b => b.classList.remove("active"));
@@ -259,7 +286,14 @@ function attachEvents() {
     $("symbolInput")?.addEventListener("change", refreshFull);
 
     ["previousPrice", "previousQuantity", "reserve"].forEach(id => {
-        attachThousandSeparatorFormatting($(id));
+        const inputEl = $(id);
+        if (!inputEl) return;
+
+        inputEl.addEventListener("input", scheduleRecalc);
+        inputEl.addEventListener("blur", () => {
+            clearTimeout(inputTimer);
+            recalculateLocal(false);
+        });
     });
 
     attachTimeframeEvents();

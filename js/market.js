@@ -4,7 +4,7 @@
 
 const TIMEFRAME_MAP = {
     '1D': { range: '1d', interval: '5m' },
-    '1W': { range: '5d', interval: '15m' },
+    '1W': { range: '7d', interval: '15m' },
     '1M': { range: '1mo', interval: '1h' },
     '3M': { range: '3mo', interval: '1d' },
     '6M': { range: '6mo', interval: '1d' },
@@ -26,65 +26,62 @@ const Market = {
             const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
             try {
-                const proxyUrl = makeProxyUrl(targetUrl);
-                const res = await fetch(proxyUrl, { signal: controller.signal });
+                const res = await fetch(makeProxyUrl(targetUrl), { signal: controller.signal });
                 clearTimeout(timeoutId);
 
-                if (res.ok) {
-                    const data = await res.json();
-                    if (data?.chart?.result?.[0]) {
-                        return data.chart.result[0];
-                    }
-                }
+                if (!res.ok) continue;
+
+                const data = await res.json();
+                if (data?.chart?.result?.[0]) return data.chart.result[0];
             } catch (err) {
                 clearTimeout(timeoutId);
-                console.warn(`[Market] Proxy attempt failed, trying fallback:`, err.message);
+                console.warn("[Market] Proxy attempt failed, trying fallback:", err.message);
             }
         }
+
         throw new Error("Unable to fetch data directly from Yahoo Finance.");
     },
 
     async fetchQuoteAndMetrics(symbol) {
-        const targetUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1y&interval=1d`;
-        const result = await this.fetchWithProxy(targetUrl);
+        const result = await this.fetchWithProxy(
+            `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1y&interval=1d`
+        );
 
         const meta = result.meta || {};
+        const quote = result.indicators?.quote?.[0] || {};
         const currentPrice = Number(meta.regularMarketPrice || meta.chartPreviousClose || 0);
-        const previousClose = Number(meta.chartPreviousClose || currentPrice);
-        const highOfDay = Number(meta.regularMarketDayHigh || currentPrice);
-        const lowOfDay = Number(meta.regularMarketDayLow || currentPrice);
+        const dailyHigh = Number(meta.regularMarketDayHigh || currentPrice);
+        const dailyLow = Number(meta.regularMarketDayLow || currentPrice);
 
-        // Derive 52-Week High from historical chart data or metadata
-        let high52 = Number(meta.fiftyTwoWeekHigh || 0);
-        if (!high52 && result.indicators?.quote?.[0]?.high) {
-            const highs = result.indicators.quote[0].high.filter(v => typeof v === 'number' && !isNaN(v));
-            if (highs.length > 0) high52 = Math.max(...highs);
-        }
-        if (!high52) high52 = Math.max(currentPrice, highOfDay);
+        const highs = (quote.high || []).filter(v => typeof v === "number" && !Number.isNaN(v));
+        const high52 = Number(
+            (meta.fiftyTwoWeekHigh || (highs.length ? Math.max(...highs) : Math.max(currentPrice, dailyHigh))).toFixed(2)
+        );
 
         return {
             symbol: meta.symbol || symbol,
             currentPrice,
-            previousClose,
-            highOfDay,
-            lowOfDay,
-            high52: Number(high52.toFixed(2)),
+            previousClose: Number((meta.chartPreviousClose || currentPrice).toFixed(2)),
+            highOfDay: Number(dailyHigh.toFixed(2)),
+            lowOfDay: Number(dailyLow.toFixed(2)),
+            high52,
             timestamp: Math.floor(Date.now() / 1000)
         };
     },
 
-    async fetchCandles(symbol, timeframe = '52W_HIGH') {
-        const tf = TIMEFRAME_MAP[timeframe] || TIMEFRAME_MAP['52W_HIGH'];
-        const targetUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${tf.range}&interval=${tf.interval}`;
+    async fetchCandles(symbol, timeframe = "52W_HIGH") {
+        const tf = TIMEFRAME_MAP[timeframe] || TIMEFRAME_MAP["52W_HIGH"];
+        const result = await this.fetchWithProxy(
+            `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${tf.range}&interval=${tf.interval}`
+        );
 
-        const result = await this.fetchWithProxy(targetUrl);
         const timestamps = result.timestamp || [];
         const closes = result.indicators?.quote?.[0]?.close || [];
-
         let candles = [];
+
         for (let i = 0; i < timestamps.length; i++) {
             const price = closes[i];
-            if (typeof price === 'number' && !isNaN(price)) {
+            if (typeof price === "number" && !Number.isNaN(price)) {
                 candles.push({
                     date: new Date(timestamps[i] * 1000),
                     price: Number(price.toFixed(2))
@@ -92,30 +89,32 @@ const Market = {
             }
         }
 
-        if (timeframe === '52W_HIGH' && candles.length > 1) {
-            let maxIdx = 0;
-            let maxPrice = -1;
-            for (let i = 0; i < candles.length; i++) {
+        if (timeframe === "52W_HIGH" && candles.length > 1) {
+            let maxIndex = 0;
+            let maxPrice = candles[0].price;
+
+            for (let i = 1; i < candles.length; i++) {
                 if (candles[i].price > maxPrice) {
                     maxPrice = candles[i].price;
-                    maxIdx = i;
+                    maxIndex = i;
                 }
             }
-            if (maxIdx < candles.length - 1) {
-                candles = candles.slice(maxIdx);
-            }
+
+            candles = candles.slice(maxIndex);
         }
 
         return candles;
     },
 
     async fetchAll(symbol) {
-        return await this.fetchQuoteAndMetrics(symbol);
+        return this.fetchQuoteAndMetrics(symbol);
     }
 };
 
 function showLoading(isFullRefresh = false) {
-    $("loadingOverlay")?.classList.remove("hidden");
+    const overlay = $("loadingOverlay");
+    overlay?.classList.remove("hidden");
+
     if (isFullRefresh) setStatus("Fetching...", "status-loading");
 }
 
@@ -125,24 +124,31 @@ function hideLoading() {
 
 function formatTimestamp(unixTime) {
     if (!unixTime) return "--";
+
     const dateObj = new Date(unixTime * 1000);
-    const dateStr = dateObj.toLocaleDateString(CONFIG.locale, {
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit"
-    });
-    const timeStr = dateObj.toLocaleTimeString(CONFIG.locale, {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit"
-    });
-    return `${dateStr} ${timeStr}`;
+    return [
+        dateObj.toLocaleDateString(CONFIG.locale, {
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit"
+        }),
+        dateObj.toLocaleTimeString(CONFIG.locale, {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit"
+        })
+    ].join(" ");
 }
 
 async function refreshMarketData(symbol) {
     try {
         showLoading(true);
-        const activeSymbol = symbol || (typeof getInputsFromScreen === "function" ? getInputsFromScreen().symbol : null) || CONFIG.defaultSymbol;
+
+        const activeSymbol =
+            symbol ||
+            (typeof getInputsFromScreen === "function" ? getInputsFromScreen().symbol : null) ||
+            CONFIG.defaultSymbol;
+
         const market = await Market.fetchAll(activeSymbol);
         window.marketData = market;
 
@@ -151,12 +157,12 @@ async function refreshMarketData(symbol) {
         setText("lastUpdated", formatTimestamp(market.timestamp));
         setStatus("Connected", "status-success");
 
-        hideLoading();
         return market;
     } catch (error) {
         console.error("Market Data Error:", error);
-        hideLoading();
         setStatus("Connection Error", "status-error");
         throw error;
+    } finally {
+        hideLoading();
     }
 }
