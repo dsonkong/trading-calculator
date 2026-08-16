@@ -96,18 +96,10 @@ function calculate(inputs) {
         inputs.previousPrice
     );
 
-    let margin = 1 / (1.2 - safetyLevel) / 100;
-
-    let sellQuantity, sellAmount;
-    if (margin <= 1 / (inputs.previousQuantity - 1)) {
-        sellQuantity = inputs.previousQuantity;
-        sellAmount = buyAmount * (1 + margin);
-    } else {
-        sellQuantity = inputs.previousQuantity - 1;
-        sellAmount = buyAmount;
-        margin = '1 unit';
-    }
-    const sellPrice = round2(sellAmount / sellQuantity);
+    const margin = 1 / (1.2 - safetyLevel) / 100;
+    const sellPrice = round2(inputs.previousPrice * (1 + margin));
+    const sellQuantity = Math.max(1, Math.floor(buyAmount / sellPrice) + 1);
+    const sellAmount = sellPrice * sellQuantity;
 
     return {
         safetyLevel,
